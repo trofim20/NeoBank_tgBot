@@ -4,6 +4,7 @@ import lombok.RequiredArgsConstructor;
 import org.example.bot.fiegn.NeoFlexTelegramAPI;
 import org.example.bot.service.AuthService;
 import org.springframework.boot.configurationprocessor.json.JSONArray;
+import org.springframework.boot.configurationprocessor.json.JSONException;
 import org.springframework.boot.configurationprocessor.json.JSONObject;
 import org.springframework.stereotype.Service;
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
@@ -25,9 +26,28 @@ public class AccountsHandler {
             }
 
             String token = authService.getUserToken(chatId);
-            String accounts = neoFlexTelegramAPI.getAccounts("Bearer " + token);
+            if (token == null) {
+                return new SendMessage(chatId.toString(),
+                        "❌ Требуется авторизация. Выполните /auth");
+            }
 
-            return new SendMessage(chatId.toString(), formatAccounts(accounts));
+            String authToken = token.startsWith("Bearer ") ? token : "Bearer " + token;
+
+            try {
+                String response = neoFlexTelegramAPI.getAccounts(authToken);
+
+                if (response.trim().startsWith("<!DOCTYPE") || response.trim().startsWith("<html")) {
+                    return new SendMessage(chatId.toString(),
+                            "❌ Сервер вернул ошибку. Попробуйте позже или выполните /auth снова");
+                }
+
+                return new SendMessage(chatId.toString(), formatAccounts(response));
+            } catch (Exception e) {
+                // Логируем ошибку для диагностики
+                System.err.println("Error fetching accounts: " + e.getMessage());
+                return new SendMessage(chatId.toString(),
+                        "❌ Ошибка при получении счетов. Попробуйте /auth снова");
+            }
 
         } catch (Exception e) {
             return new SendMessage(chatId.toString(),
@@ -37,29 +57,42 @@ public class AccountsHandler {
 
     private String formatAccounts(String jsonAccounts) {
         try {
-            JSONArray accounts = new JSONArray(jsonAccounts);
-            if (accounts.length() == 0) {
-                return "У вас пока нет открытых счетов";
+            try {
+                JSONArray accounts = new JSONArray(jsonAccounts);
+                return formatAccountsArray(accounts);
+            } catch (JSONException e) {
+                // Если не получилось как массив, пробуем как объект с полем accounts
+                JSONObject response = new JSONObject(jsonAccounts);
+                if (response.has("accounts")) {
+                    return formatAccountsArray(response.getJSONArray("accounts"));
+                }
+                throw new JSONException("Invalid accounts format");
             }
-
-            StringBuilder sb = new StringBuilder("Ваши счета\n\n");
-
-            for (int i = 0; i < accounts.length(); i++) {
-                JSONObject account = accounts.getJSONObject(i);
-
-                sb.append("Счет #").append(i+1).append("*\n");
-                sb.append("┌ Номер: `").append(account.getString("accountNumber")).append("`\n");
-                sb.append("├ Баланс: *").append(formatAmount(account.getDouble("amount"))).append("*\n");
-                sb.append("├ Доступно: *").append(formatAmount(account.getDouble("availableAmount"))).append("*\n");
-                sb.append("├ Валюта: ").append(getCurrencyName(account.getInt("currencyNumber"))).append("\n");
-                sb.append("├ Статус: ").append(formatStatus(account.getString("accountStatus"))).append("\n");
-                sb.append("└ Дата открытия: ").append(account.getString("startDate")).append("\n\n");
-            }
-
-            return sb.toString();
         } catch (Exception e) {
             return "⚠ Не удалось загрузить информацию о счетах";
         }
+    }
+
+    private String formatAccountsArray(JSONArray accounts) throws JSONException {
+        if (accounts.length() == 0) {
+            return "У вас пока нет открытых счетов";
+        }
+
+        StringBuilder sb = new StringBuilder("Ваши счета\n\n");
+
+        for (int i = 0; i < accounts.length(); i++) {
+            JSONObject account = accounts.getJSONObject(i);
+
+            sb.append("Счет #").append(i+1).append("*\n");
+            sb.append("┌ Номер: `").append(account.getString("accountNumber")).append("`\n");
+            sb.append("├ Баланс: *").append(formatAmount(account.getDouble("amount"))).append("*\n");
+            sb.append("├ Доступно: *").append(formatAmount(account.getDouble("availableAmount"))).append("*\n");
+            sb.append("├ Валюта: ").append(getCurrencyName(account.getInt("currencyNumber"))).append("\n");
+            sb.append("├ Статус: ").append(formatStatus(account.getString("accountStatus"))).append("\n");
+            sb.append("└ Дата открытия: ").append(account.getString("startDate")).append("\n\n");
+        }
+
+        return sb.toString();
     }
 
     private String formatAmount(double amount) {
