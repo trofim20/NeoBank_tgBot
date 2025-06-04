@@ -1,0 +1,46 @@
+spring:
+  application:
+    name: NeoBank_tgBot
+  datasource:
+    url: jdbc:postgresql://localhost:5433/testNeoBank
+    username: postgres
+    password: 1111
+  jpa:
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+    hibernate:
+      ddl-auto: update
+  ssl:
+    bundle:
+      jks:
+        bff-client:
+          truststore:
+            location: "classpath:cacerts"
+            password: "changeit"
+
+feign:
+  bff-api:
+    url: https://msa-bff-telegram-neobank.neoflex.ru
+
+telegram:
+  bot:
+    name: ${BOT_NAME:YourDefaultBotName}
+    token: ${BOT_TOKEN:YourDefaultBotToken}
+
+server:
+  port: 8081
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: "*"
+
+app:
+  name: neoBank
+  version: 1.0
+
+logging:
+  level:
+    org.springframework.cloud.openfeign: DEBUG
