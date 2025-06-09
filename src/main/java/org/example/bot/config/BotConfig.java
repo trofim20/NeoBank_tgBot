@@ -13,5 +13,4 @@ public record BotConfig(
     public BotConfig {
         System.out.println("Config loaded. Name: " + name + ", Token: " + token);
     }
-
 }
