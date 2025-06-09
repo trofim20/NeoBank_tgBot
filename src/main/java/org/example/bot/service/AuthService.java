@@ -2,19 +2,18 @@ package org.example.bot.service;
 
 import lombok.RequiredArgsConstructor;
 import org.example.bot.config.BotConfig;
-
 import org.example.bot.fiegn.NeoFlexTelegramAPI;
+import org.springframework.boot.configurationprocessor.json.JSONException;
 import org.springframework.boot.configurationprocessor.json.JSONObject;
 import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Service;
 import org.telegram.telegrambots.meta.api.objects.User;
 
-import java.net.URLEncoder;
 import java.security.MessageDigest;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.nio.charset.StandardCharsets;
-import java.util.Formatter;
 
 import org.apache.commons.codec.digest.HmacUtils;
 import org.springframework.web.util.UriComponentsBuilder;
@@ -28,181 +27,309 @@ import org.apache.commons.codec.digest.HmacAlgorithms;
 @Service
 @RequiredArgsConstructor
 public class AuthService {
+    private static final String BOT_ID = "7678902604";
+    private static final String BOT_USERNAME = "TestNeoBank_bot";
+    private static final String CHAT_TYPE = "private";
     private static final String AUTH_URL = "https://msa-bff-telegram-neobank.neoflex.ru/v1/auth";
 
     private final BotConfig botConfig;
     private final NeoFlexTelegramAPI neoFlexTelegramAPI;
     private final Map<Long, String> userTokens = new ConcurrentHashMap<>();
     private final Map<Long, Boolean> botVerified = new ConcurrentHashMap<>();
-    private final Map<Long, String> userHashes = new ConcurrentHashMap<>();
-
 
     /**
-     * Верифицирует бота перед авторизацией
+     * Проверяет и верифицирует бота для указанного чата и пользователя.
+     *
+     * @param chatId идентификатор чата
+     * @param user   объект пользователя Telegram
+     * @return объект AuthResponse с результатом операции
      */
     public AuthResponse verifyBot(Long chatId, User user) {
-        if (botVerified.getOrDefault(chatId, false)) {
-            return new AuthResponse(null, "Бот уже верифицирован", false);
+        if (isBotVerified(chatId)) {
+            return AuthResponse.alreadyVerified();
         }
 
         try {
-            long authDate = System.currentTimeMillis();
-            String hash = createSignature(chatId, user);
-
+            AuthData authData = buildAuthData(chatId, user);
             ResponseEntity<String> response = neoFlexTelegramAPI.getTempToken(
-                    chatId,
-                    "private",
-                    user.getId(),
-                    user.getFirstName(),
-                    "",
-                    user.getUserName(),
-                    "TestNeoBank_bot",
-                    "7678902604",
-                    hash,
-                    authDate
+                    authData.chatId(),
+                    authData.chatType(),
+                    authData.userId(),
+                    authData.firstName(),
+                    authData.lastName().orElse(""),
+                    authData.username().orElse(""),
+                    authData.botUsername(),
+                    authData.botId(),
+                    authData.hash(),
+                    authData.authDate()
             );
 
-            if (response.getStatusCode().is2xxSuccessful() ||
-                    (response.getStatusCode().is4xxClientError() &&
-                            response.getBody() != null &&
-                            response.getBody().contains("/token"))) {
-
-                botVerified.put(chatId, true);
-                return new AuthResponse(null, null, false);
+            if (response.getBody() != null && response.getBody().contains("<!DOCTYPE html>")) {
+                return AuthResponse.error("Ошибка аутентификации. Проверьте токен бота");
             }
 
-            return new AuthResponse(null,
-                    "Ошибка верификации: " + response.getStatusCode() + " - " + response.getBody(),
-                    false);
+            markBotAsVerified(chatId);
+            return AuthResponse.success();
 
         } catch (Exception e) {
-
-            if (e.getMessage() != null && e.getMessage().contains("/token")) {
-                botVerified.put(chatId, true);
-                return new AuthResponse(null, null, false);
-            }
-            return new AuthResponse(null, "Ошибка верификации бота", false);
+            return AuthResponse.error("Ошибка верификации бота: " + e.getMessage());
         }
     }
 
     /**
-     * Обрабатывает запрос на авторизацию пользователя.
+     * Извлекает сообщение об ошибке из исключения.
      *
-     * @param chatId идентификатор чата пользователя в Telegram
-     * @param user данные пользователя из Telegram
-     * @return AuthResponse с URL для авторизации или сообщением об ошибке
+     * @param e исключение
+     * @return сообщение об ошибке
+     */
+    private String extractErrorMessage(Exception e) {
+        String message = e.getMessage();
+        if (message == null) return "Неизвестная ошибка";
+
+        int startIdx = message.indexOf("\"errorDetail\":\"");
+        if (startIdx > 0) {
+            startIdx += "\"errorDetail\":\"".length();
+            int endIdx = message.indexOf("\"", startIdx);
+            if (endIdx > startIdx) {
+                return message.substring(startIdx, endIdx);
+            }
+        }
+        return message;
+    }
+
+    /**
+     * Обрабатывает запрос на авторизацию для указанного чата и пользователя.
+     *
+     * @param chatId идентификатор чата
+     * @param user   объект пользователя Telegram
+     * @return объект AuthResponse с URL для авторизации или сообщением об ошибке
      */
     public AuthResponse handleAuthRequest(Long chatId, User user) {
         try {
-            if (!botVerified.getOrDefault(chatId, false)) {
-                return new AuthResponse(null, "Сначала выполните верификацию бота", false);
+            if (!isBotVerified(chatId)) {
+                return AuthResponse.error("Сначала выполните верификацию бота");
             }
 
-            long authDate = System.currentTimeMillis();
-            String hash = createSignature(chatId, user);
+            AuthData authData = buildAuthData(chatId, user);
+            String authUrl = buildAuthUrl(authData);
 
-
-            String authUrl = String.format("%s?chat_id=%d&chat_type=private&user_id=%d&first_name=%s&last_name=%s&username=%s&bot_username=%s&bot_id=%s&hash=%s&auth_date=%d",
-                    AUTH_URL,
-                    chatId,
-                    user.getId(),
-                    URLEncoder.encode(user.getFirstName(), StandardCharsets.UTF_8),
-                    "",
-                    user.getUserName() != null ? user.getUserName() : "",
-                    "TestNeoBank_bot",
-                    "7678902604",
-                    hash,
-                    authDate);
-
-            return new AuthResponse(authUrl, null, false);
+            return AuthResponse.withUrl(authUrl);
         } catch (Exception e) {
-            return new AuthResponse(null, "Ошибка сервиса авторизации: " + e.getMessage(), false);
+            return AuthResponse.error("Ошибка сервиса авторизации: " + extractErrorMessage(e));
         }
     }
 
+    /**
+     * Получает временный токен пользователя для указанного чата.
+     *
+     * @param chatId идентификатор чата
+     * @param user   объект пользователя Telegram
+     * @return строку с токеном пользователя в формате "Bearer {token}"
+     * @throws Exception если бот не верифицирован или произошла ошибка при получении токена
+     */
     public String fetchUserToken(Long chatId, User user) throws Exception {
-        if (!botVerified.getOrDefault(chatId, false)) {
+        if (!isBotVerified(chatId)) {
             throw new IllegalStateException("Сначала выполните верификацию бота через /start");
         }
 
-        long authDate = System.currentTimeMillis();
-        String hash = createSignature(chatId,user);
-        userHashes.put(chatId, hash);
-
+        AuthData authData = buildAuthData(chatId, user);
         ResponseEntity<String> response = neoFlexTelegramAPI.getTempToken(
-                chatId,
-                "private",
-                user.getId(),
-                user.getFirstName(),
-                user.getLastName() != null ? user.getLastName() : "",
-                user.getUserName() != null ? user.getUserName() : "",
-                "TestNeoBank_bot",
-                "7678902604",
-                hash,
-                authDate
+                authData.chatId(),
+                authData.chatType(),
+                authData.userId(),
+                authData.firstName(),
+                authData.lastName().orElse(""),
+                authData.username().orElse(""),
+                authData.botUsername(),
+                authData.botId(),
+                authData.hash(),
+                authData.authDate()
         );
 
-        JSONObject json = new JSONObject(response.getBody());
-        String token = json.getString("access_token");
+        if (response.getBody() != null && response.getBody().contains("<!DOCTYPE html>")) {
+            throw new IllegalStateException("Ошибка аутентификации. Неверный токен бота");
+        }
 
-        saveUserToken(chatId, token);
-        return token;
+        try {
+            JSONObject json = new JSONObject(response.getBody());
+            return "Bearer " + json.getString("access_token");
+        } catch (JSONException e) {
+            throw new IllegalStateException("Неверный формат ответа сервера");
+        }
     }
 
     /**
-     * Формирует строку данных для подписи в едином формате
+     * Создает объект AuthData для указанного чата и пользователя.
+     *
+     * @param chatId идентификатор чата
+     * @param user   объект пользователя Telegram
+     * @return объект AuthData с данными для авторизации
+     * @throws Exception если произошла ошибка при создании подписи
      */
-    private String buildSignatureDate(Long chatId, User user) {
-        return String.format(
-                "bot_id=7678902604\n" +
-                        "bot_username=%s\n" +
-                        "chat_id=%d\n" +
-                        "chat_type=private\n" +
-                        "first_name=%s\n" +
-                        "last_name=%s\n" +
-                        "user_id=%d\n" +
-                        "username=%s",
-                "TestNeoBank_bot",
+    private AuthData buildAuthData(Long chatId, User user) throws Exception {
+        return new AuthData(
                 chatId,
-                user.getFirstName(),
-                user.getLastName() != null ? user.getLastName() : "",
+                CHAT_TYPE,
                 user.getId(),
-                user.getUserName() != null ? user.getUserName() : ""
+                user.getFirstName(),
+                Optional.ofNullable(user.getLastName()),
+                Optional.ofNullable(user.getUserName()),
+                BOT_USERNAME,
+                BOT_ID,
+                createSignature(chatId, user),
+                System.currentTimeMillis()
         );
     }
 
     /**
-     * Создает подпись для запроса
+     * Строит URL для авторизации на основе данных AuthData.
+     *
+     * @param authData данные для авторизации
+     * @return строку с URL для авторизации
+     * @throws Exception если произошла ошибка при кодировании параметров
+     */
+    private String buildAuthUrl(AuthData authData) throws Exception {
+        UriComponentsBuilder builder = UriComponentsBuilder.fromHttpUrl(AUTH_URL)
+                .queryParam("chat_id", authData.chatId())
+                .queryParam("chat_type", authData.chatType())
+                .queryParam("user_id", authData.userId())
+                .queryParam("first_name", authData.firstName())
+                .queryParam("last_name", authData.lastName().orElse(""))
+                .queryParam("username", authData.username().orElse(""))
+                .queryParam("bot_username", authData.botUsername())
+                .queryParam("bot_id", authData.botId())
+                .queryParam("hash", authData.hash())
+                .queryParam("auth_date", authData.authDate());
+
+        return builder.build().toUriString();
+    }
+
+    /**
+     * Создает криптографическую подпись для запроса авторизации.
+     *
+     * @param chatId идентификатор чата
+     * @param user   объект пользователя Telegram
+     * @return строку с хеш-подписью
+     * @throws Exception если произошла ошибка при создании подписи
      */
     private String createSignature(Long chatId, User user) throws Exception {
         String secretKey = sha256(botConfig.token());
-        String data = buildSignatureDate(chatId,user);
-        return hmacSha256(secretKey, data);
+        System.out.println(secretKey);
+        String data = buildSignatureData(chatId, user);
+        System.out.println("Data for hash: " + data);
+        String hash = hmacSha256(secretKey, data);
+        System.out.println("Generated hash: " + hash);
+        return hash;
     }
 
-    public void forceVerifyBot(Long chatId) {
+    /**
+     * Формирует строку данных для создания подписи.
+     *
+     * @param chatId идентификатор чата
+     * @param user   объект пользователя Telegram
+     * @return строку с данными для подписи
+     */
+    private String buildSignatureData(Long chatId, User user) {
+        StringBuilder sb = new StringBuilder();
+        appendField(sb, "bot_id", BOT_ID);
+        appendField(sb, "bot_username", BOT_USERNAME);
+        appendField(sb, "chat_id", chatId.toString());
+        appendField(sb, "chat_type", CHAT_TYPE);
+        appendField(sb, "first_name", user.getFirstName());
+        appendField(sb, "last_name", user.getLastName() != null ? user.getLastName() : "");
+        appendField(sb, "user_id", user.getId().toString());
+        if (user.getUserName() != null) {
+            appendField(sb, "username", user.getUserName());
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Добавляет поле в строку данных для подписи.
+     *
+     * @param sb         StringBuilder для формирования строки
+     * @param fieldName  название поля
+     * @param fieldValue значение поля
+     */
+    private void appendField(StringBuilder sb, String fieldName, String fieldValue) {
+        if (sb.length() > 0) {
+            sb.append("\n");
+        }
+        sb.append(fieldName).append("=").append(fieldValue);
+    }
+
+    /**
+     * Проверяет, верифицирован ли бот для указанного чата.
+     *
+     * @param chatId идентификатор чата
+     * @return true если бот верифицирован, false в противном случае
+     */
+    private boolean isBotVerified(Long chatId) {
+        return botVerified.getOrDefault(chatId, false);
+    }
+
+    /**
+     * Помечает бота как верифицированного для указанного чата.
+     *
+     * @param chatId идентификатор чата
+     */
+    private void markBotAsVerified(Long chatId) {
         botVerified.put(chatId, true);
     }
 
     /**
-     * Генерирует SHA-256 хеш из входной строки.
+     * Проверяет валидность токена.
      *
-     * @param input входная строка для хеширования
-     * @return хеш в HEX-формате
-     * @throws Exception если алгоритм хеширования недоступен
+     * @param token токен для проверки
+     * @return true если токен валиден, false в противном случае
+     */
+    public boolean isTokenValid(String token) {
+        try {
+            String authToken = token.startsWith("Bearer ") ? token : "Bearer " + token;
+            String response = neoFlexTelegramAPI.getAccounts(authToken);
+            return !(response.trim().startsWith("<!DOCTYPE") || response.trim().startsWith("<html"));
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
+     * Получает валидный токен пользователя, обновляя его при необходимости.
+     *
+     * @param chatId идентификатор чата
+     * @param user объект пользователя Telegram
+     * @return валидный токен пользователя
+     * @throws Exception если произошла ошибка при получении токена
+     */
+    public String getValidUserToken(Long chatId, User user) throws Exception {
+        String token = getUserToken(chatId);
+        if (token == null || !isTokenValid(token)) {
+            token = fetchUserToken(chatId, user);
+            saveUserToken(chatId, token);
+        }
+        return token;
+    }
+
+    /**
+     * Вычисляет SHA-256 хеш строки.
+     *
+     * @param input входная строка
+     * @return хеш строки в шестнадцатеричном формате
+     * @throws Exception если произошла ошибка при вычислении хеша
      */
     private String sha256(String input) throws Exception {
+        System.out.println("Using bot token: " + botConfig.token()); // Логируем токен
         MessageDigest digest = MessageDigest.getInstance("SHA-256");
         byte[] hash = digest.digest(input.getBytes(StandardCharsets.UTF_8));
         return bytesToHex(hash);
     }
 
     /**
-     * Генерирует HMAC-SHA256 подпись для данных.
+     * Вычисляет HMAC-SHA256 подпись для данных с использованием ключа.
      *
-     * @param key секретный ключ для подписи
+     * @param key  секретный ключ
      * @param data данные для подписи
-     * @return подпись в HEX-формате
+     * @return подпись в шестнадцатеричном формате
      */
     private String hmacSha256(String key, String data) {
         return new HmacUtils(HmacAlgorithms.HMAC_SHA_256, key.getBytes(StandardCharsets.UTF_8))
@@ -210,24 +337,24 @@ public class AuthService {
     }
 
     /**
-     * Конвертирует массив байт в HEX-строку.
+     * Преобразует массив байтов в шестнадцатеричную строку.
      *
-     * @param bytes массив байт для конвертации
-     * @return HEX-строка
+     * @param bytes массив байтов
+     * @return шестнадцатеричную строку
      */
     private static String bytesToHex(byte[] bytes) {
-        Formatter formatter = new Formatter();
+        StringBuilder sb = new StringBuilder();
         for (byte b : bytes) {
-            formatter.format("%02x", b);
+            sb.append(String.format("%02x", b));
         }
-        return formatter.toString();
+        return sb.toString();
     }
 
     /**
-     * Сохраняет токен авторизации для указанного чата.
+     * Сохраняет токен пользователя для указанного чата.
      *
      * @param chatId идентификатор чата
-     * @param token токен авторизации
+     * @param token  токен пользователя
      */
     public void saveUserToken(Long chatId, String token) {
         userTokens.put(chatId, token);
@@ -237,25 +364,116 @@ public class AuthService {
      * Проверяет, авторизован ли пользователь в указанном чате.
      *
      * @param chatId идентификатор чата
-     * @return true если пользователь авторизован, иначе false
+     * @return true если пользователь авторизован, false в противном случае
      */
     public boolean isAuthorized(Long chatId) {
         return userTokens.containsKey(chatId);
     }
 
     /**
-     * Возвращает токен пользователя
+     * Получает токен пользователя для указанного чата.
+     *
+     * @param chatId идентификатор чата
+     * @return токен пользователя или null если токен не найден
      */
     public String getUserToken(Long chatId) {
         return userTokens.get(chatId);
     }
 
     /**
-     * Результат обработки запроса авторизации.
+     * Принудительно помечает бота как верифицированного для указанного чата.
      *
-     * @param authUrl URL для перенаправления на авторизацию (null если ошибка или уже авторизован)
-     * @param error сообщение об ошибке (null если успешно)
-     * @param isAuthorized флаг, указывающий что пользователь уже авторизован
+     * @param chatId идентификатор чата
      */
-    public record AuthResponse(String authUrl, String error, boolean isAuthorized) {}
+    public void forceVerifyBot(Long chatId) {
+        botVerified.put(chatId, true);
+    }
+
+    /**
+     * Внутренний класс для хранения данных авторизации.
+     */
+    private record AuthData(
+            Long chatId,
+            String chatType,
+            Long userId,
+            String firstName,
+            Optional<String> lastName,
+            Optional<String> username,
+            String botUsername,
+            String botId,
+            String hash,
+            Long authDate
+    ) {
+    }
+
+    /**
+     * Класс для формирования ответов сервиса авторизации.
+     */
+    public static final class AuthResponse {
+        private final String authUrl;
+        private final String error;
+        private final boolean isAuthorized;
+
+        private AuthResponse(String authUrl, String error, boolean isAuthorized) {
+            this.authUrl = authUrl;
+            this.error = error;
+            this.isAuthorized = isAuthorized;
+        }
+
+        /**
+         * Создает успешный ответ без дополнительных данных.
+         *
+         * @return объект AuthResponse
+         */
+        public static AuthResponse success() {
+            return new AuthResponse(null, null, false);
+        }
+
+        /**
+         * Создает ответ с сообщением о том, что бот уже верифицирован.
+         *
+         * @return объект AuthResponse
+         */
+        public static AuthResponse alreadyVerified() {
+            return new AuthResponse(null, "Бот уже верифицирован", false);
+        }
+
+        /**
+         * Создает ответ с URL для авторизации.
+         *
+         * @param authUrl URL для авторизации
+         * @return объект AuthResponse
+         */
+        public static AuthResponse withUrl(String authUrl) {
+            return new AuthResponse(authUrl, null, false);
+        }
+
+        /**
+         * Создает ответ с сообщением об ошибке.
+         *
+         * @param message сообщение об ошибке
+         * @return объект AuthResponse
+         */
+        public static AuthResponse error(String message) {
+            return new AuthResponse(null, message, false);
+        }
+
+        /**
+         * Возвращает URL для авторизации.
+         *
+         * @return URL для авторизации или null
+         */
+        public String authUrl() {
+            return authUrl;
+        }
+
+        /**
+         * Возвращает сообщение об ошибке.
+         *
+         * @return сообщение об ошибке или null
+         */
+        public String error() {
+            return error;
+        }
+    }
 }
